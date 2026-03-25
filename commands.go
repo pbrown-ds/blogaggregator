@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/DuperSoup/blogaggregator/internal/config"
@@ -28,6 +31,7 @@ type commands struct {
 	commandMap map[string]func(*state, command) error
 }
 
+// Replaces the currently logged in user with the username provided.
 func handlerLogin(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		return fmt.Errorf("please provide a username after the login command\n")
@@ -51,6 +55,7 @@ func handlerLogin(s *state, cmd command) error {
 	return nil
 }
 
+// Registers a new user with the provided username.
 func handlerRegister(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		return fmt.Errorf("please provide a username after the register command\n")
@@ -128,20 +133,43 @@ func handlerGetUsers(s *state, cmd command) error {
 	return nil
 }
 
+// Aggregates feeds by fetching the RSS Feeds, parsing them, and printing the posts to the console all in a long-running loop. Provide a time between requests.
 func handlerAgg(s *state, cmd command) error {
-	// provided test url
-	url := "https://www.wagslane.dev/index.xml"
+	// Get the time between requests
+	if len(cmd.args) == 0 {
+		return fmt.Errorf("please provide a time between requests after the Agg command in this format: #units (ex. 1m for 1 minute)\n")
+	}
 
-	feed, err := fetchFeed(context.Background(), url)
+	timebr := cmd.args[0]
+
+	time_between_requests, err := time.ParseDuration(timebr)
 	if err != nil {
-		fmt.Printf("Unable fetch feed at url: %v\n", err)
+		fmt.Printf("Error parsing time between requests: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Print(feed)
+
+	fmt.Printf("Collecting feeds every %s\n", timebr)
+
+	// Start ticker wit the time between requests
+	ticker := time.NewTicker(time_between_requests)
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
+	}
+
+	// // provided test url
+	// url := "https://www.wagslane.dev/index.xml"
+	//
+	// feed, err := fetchFeed(context.Background(), url)
+	// if err != nil {
+	// 	fmt.Printf("Unable fetch feed at url: %v\n", err)
+	// 	os.Exit(1)
+	// }
+	// fmt.Print(feed)
 
 	return nil
 }
 
+// Adds a feed with the provided feed name  and url to the current user's followed feeds.
 func handlerAddFeed(s *state, cmd command, user database.User) error {
 	if len(cmd.args) <= 1 {
 		return fmt.Errorf("please provide a feed name and url after the AddFeed  command\n")
@@ -333,6 +361,41 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+// Takes an optional "limit" parameter and prints posts to the terminal up to the limit
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	// Set the limit to 2 by default
+	limit := 2
+	if len(cmd.args) == 1 {
+		specifiedLimit, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			fmt.Printf("Error setting browse limit: %v\n", err)
+			os.Exit(1)
+		}
+		limit = specifiedLimit
+	}
+
+	postsForUserParams := database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+	}
+
+	// Print posts to terminal based on user
+	posts_for_user, err := s.db.GetPostsForUser(context.Background(), postsForUserParams)
+	if err != nil {
+		fmt.Printf("Error getting posts for current user: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, post := range posts_for_user {
+		fmt.Printf("Title: %v\n", post.Title)
+		fmt.Printf("URL: %v\n", post.Url)
+		fmt.Printf("Description: %v\n", post.Description)
+		fmt.Printf("Publish Date: %v\n\n", post.PublishedAt)
+	}
+
+	return nil
+}
+
 func middlewareLoggedIn(
 	handler func(s *state, cmd command, user database.User) error,
 ) func(*state, command) error {
@@ -373,6 +436,64 @@ func (c *commands) register(name string, f func(*state, command) error) error {
 
 	// Set new command name and function in map
 	c.commandMap[name] = f
+
+	return nil
+}
+
+// Gets the next feed to fetch from the DB, marks it as fetched, then fetches the feed using the provided URL, and iterates over the items in the feed and prints their titles to the console
+func scrapeFeeds(s *state) error {
+	// Get next feed to fetch
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		fmt.Printf("Error getting next feed to fetch: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Mark feed as fetched
+	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		fmt.Printf("Error marking feed as fetched: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Fetch the feed content using its url
+	rss_feed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		fmt.Printf("Error fetching RSS Feed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Iterate over items in the RSSFeed and save posts to database
+	for _, item := range rss_feed.Channel.Item {
+		// Parse publish date if needed
+		publishedAt, err := time.Parse(time.RFC1123Z, item.PubDate)
+		if err != nil {
+			publishedAt = time.Now()
+		}
+
+		// Set feed parameters
+		postParams := database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: publishedAt,
+			FeedID:      feed.ID,
+		}
+
+		// Create post with params
+		_, err = s.db.CreatePost(context.Background(), postParams)
+		if err != nil {
+			if strings.Contains(err.Error(), "unique constraint") {
+				// post with that url already exists, skip it
+				continue
+			}
+			// some other error, log it
+			log.Printf("Error creating post: %v\n", err)
+		}
+	}
 
 	return nil
 }

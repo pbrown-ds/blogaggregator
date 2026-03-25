@@ -93,6 +93,11 @@ func main() {
 		fmt.Printf("Problem registering unfollow command: %v\n", err)
 		os.Exit(1)
 	}
+	err = cmds.register("browse", middlewareLoggedIn(handlerBrowse))
+	if err != nil {
+		fmt.Printf("Problem registering browse command: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Parse arguments
 	term_args := os.Args
